@@ -1,6 +1,6 @@
 import modal
 
-app = modal.App("asr-finetune-stage2")
+app = modal.App("asr-finetune")
 
 image = modal.Image.debian_slim(python_version="3.11").apt_install("ffmpeg").pip_install(
     "torch==2.6.0",
@@ -8,15 +8,20 @@ image = modal.Image.debian_slim(python_version="3.11").apt_install("ffmpeg").pip
     "transformers==4.46.3",
     "datasets==3.1.0",
     "accelerate==1.1.1",
-    "peft==0.13.2",
+    "tensorboard==2.18.0",
     "jiwer==3.0.5",
     "librosa==0.10.2",
     "soundfile==0.12.1",
-    "tensorboard==2.18.0",
 )
 
 CPUS = 8
+EVAL_STEPS = 50
 runs = modal.Volume.from_name("asr-finetune-runs", create_if_missing=True)
+
+STAGES = {
+    1: dict(augment=False, lr=1e-5, warmup=100, batch_size=32, eval_batch_size=16, grad_accum=1, max_steps=1500),
+    2: dict(augment=True, lr=5e-5, warmup=40, batch_size=8, eval_batch_size=4, grad_accum=4, max_steps=1000),
+}
 
 
 @app.cls(
@@ -34,18 +39,17 @@ class Trainer:
         self,
         dataset: str,
         hf_repo: str,
+        stage: int,
         model: str,
-        language: str = "yo",
-        text_column: str = "transcription",
-        train_split: str = "train",
-        eval_split: str = "validation",
-        max_steps: int = 1000,
-        lr: float = 5e-5,
-        eval_steps: int = 50,
-        spec_augment: bool = False,
+        language: str,
+        text_column: str,
+        train_split: str,
+        eval_split: str,
+        max_steps: int,
+        lr: float,
+        batch_size: int,
+        grad_accum: int,
     ) -> str:
-        from dataclasses import dataclass
-
         import jiwer
         import numpy as np
         import torch
@@ -60,6 +64,9 @@ class Trainer:
             WhisperProcessor,
         )
         from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+
+        overrides = dict(max_steps=max_steps, lr=lr, batch_size=batch_size, grad_accum=grad_accum)
+        cfg = {**STAGES[stage], **{k: v for k, v in overrides.items() if v}}
 
         name = hf_repo.replace("/", "_")
         log_path, samples_path = f"/runs/{name}.tsv", f"/runs/{name}_samples.tsv"
@@ -92,43 +99,40 @@ class Trainer:
             example["duration"] = len(audio["array"]) / audio["sampling_rate"]
             return example
 
-        def process(split, augment=False):
+        def process(split, augment):
             ds = load_dataset(dataset, split=split).cast_column("audio", Audio(sampling_rate=16000))
             return (
                 ds.shuffle(seed=42)
                 .map(
-                    lambda x: prepare(x, augment),
+                    prepare,
+                    fn_kwargs={"augment": augment},
                     remove_columns=["audio"],
                     writer_batch_size=1,
-                    num_proc=1,
+                    num_proc=1 if cfg["augment"] else CPUS,
                 )
                 .filter(lambda x: bool(x[text_column]) and x["duration"] <= 30 and len(x["labels"]) <= 448)
             )
 
-        train_ds, eval_ds = process(train_split, augment=True), process(eval_split)
+        train_ds, eval_ds = process(train_split, cfg["augment"]), process(eval_split, False)
 
         net = WhisperForConditionalGeneration.from_pretrained(model)
-        net.config.apply_spec_augment = spec_augment
+        net.config.apply_spec_augment = net.config.d_model == 1280  # SpecAugment for large models only
         net.config.use_cache = False
         net.config.forced_decoder_ids = None
         net.generation_config.forced_decoder_ids = None
         net.generation_config.language = language
         net.generation_config.task = "transcribe"
 
-        @dataclass
-        class Collator:
-            def __call__(self, features):
-                batch = processor.feature_extractor.pad(
-                    [{"input_features": f["input_features"]} for f in features], return_tensors="pt"
-                )
-                labels = processor.tokenizer.pad(
-                    [{"input_ids": f["labels"]} for f in features], return_tensors="pt"
-                )
-                ids = labels["input_ids"].masked_fill(labels["attention_mask"].ne(1), -100)
-                if (ids[:, 0] == net.config.decoder_start_token_id).all():
-                    ids = ids[:, 1:]
-                batch["labels"] = ids
-                return batch
+        def collate(features):
+            batch = processor.feature_extractor.pad(
+                [{"input_features": f["input_features"]} for f in features], return_tensors="pt"
+            )
+            labels = processor.tokenizer.pad([{"input_ids": f["labels"]} for f in features], return_tensors="pt")
+            ids = labels["input_ids"].masked_fill(labels["attention_mask"].ne(1), -100)
+            if (ids[:, 0] == net.config.decoder_start_token_id).all():
+                ids = ids[:, 1:]
+            batch["labels"] = ids
+            return batch
 
         def compute_metrics(pred):
             pred.label_ids[pred.label_ids == -100] = processor.tokenizer.pad_token_id
@@ -160,22 +164,22 @@ class Trainer:
 
         args = Seq2SeqTrainingArguments(
             output_dir="/tmp/out",
-            max_steps=max_steps,
-            learning_rate=lr,
+            max_steps=cfg["max_steps"],
+            learning_rate=cfg["lr"],
             lr_scheduler_type="polynomial",
             lr_scheduler_kwargs={"lr_end": 1e-8, "power": 4},
-            warmup_steps=40,
-            per_device_train_batch_size=8,
-            per_device_eval_batch_size=4,
-            gradient_accumulation_steps=4,
+            warmup_steps=cfg["warmup"],
+            per_device_train_batch_size=cfg["batch_size"],
+            per_device_eval_batch_size=cfg["eval_batch_size"],
+            gradient_accumulation_steps=cfg["grad_accum"],
             gradient_checkpointing=True,
             fp16=True,
             logging_steps=5,
             eval_strategy="steps",
-            eval_steps=eval_steps,
+            eval_steps=EVAL_STEPS,
             eval_on_start=True,
             save_strategy="steps",
-            save_steps=eval_steps,
+            save_steps=EVAL_STEPS,
             save_total_limit=2,
             load_best_model_at_end=True,
             metric_for_best_model="wer",
@@ -183,14 +187,15 @@ class Trainer:
             predict_with_generate=True,
             generation_max_length=128,
             remove_unused_columns=False,
-            report_to="none",
+            report_to="tensorboard",
+            logging_dir=f"/runs/{name}_tb",
         )
         trainer = Seq2SeqTrainer(
             model=net,
             args=args,
             train_dataset=train_ds,
             eval_dataset=eval_ds,
-            data_collator=Collator(),
+            data_collator=collate,
             compute_metrics=compute_metrics,
             processing_class=processor,
             callbacks=[TsvLogger()],
@@ -210,27 +215,25 @@ class Trainer:
 def main(
     dataset: str,
     hf_repo: str,
-    model: str,
+    stage: int,
+    model: str = "",
     language: str = "yo",
-    gpu: str = "L4",
+    gpu: str = "",
     text_column: str = "transcription",
     train_split: str = "train",
     eval_split: str = "validation",
-    max_steps: int = 1000,
-    lr: float = 5e-5,
-    spec_augment: bool = False,
+    max_steps: int = 0,
+    lr: float = 0.0,
+    batch_size: int = 0,
+    grad_accum: int = 0,
 ):
-    print(
-        Trainer.with_options(gpu=gpu)().train.remote(
-            dataset=dataset,
-            hf_repo=hf_repo,
-            model=model,
-            language=language,
-            text_column=text_column,
-            train_split=train_split,
-            eval_split=eval_split,
-            max_steps=max_steps,
-            lr=lr,
-            spec_augment=spec_augment,
-        )
-    )
+    options = dict(locals())
+    gpu = options.pop("gpu")
+    if stage not in STAGES:
+        raise ValueError("stage must be 1 or 2")
+    if not model:
+        if stage == 2:
+            raise ValueError("Stage 2 starts from the stage 1 model: pass its HuggingFace repo as --model")
+        options["model"] = "openai/whisper-small"
+    gpu = gpu or ("L40S" if "large" in options["model"] else "L4")
+    print(Trainer.with_options(gpu=gpu)().train.remote(**options))
